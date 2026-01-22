@@ -1,6 +1,7 @@
 package csocks
 
 import (
+	"context"
 	"errors"
 )
 
@@ -15,6 +16,7 @@ type ListenConfig struct {
 	ServerKeyFile  string
 	Secret         string
 	WithHttp       bool
+	PublicKeyFile  string
 }
 
 func NewListenConfig() *ListenConfig {
@@ -25,20 +27,21 @@ func NewListenConfig() *ListenConfig {
 		ServerKeyFile:  "",
 		Secret:         "anonymous",
 		WithHttp:       false,
+		PublicKeyFile:  "",
 	}
 }
 
-func StartServer(listenConfig *ListenConfig, quiet bool) error {
+func StartServer(ctx context.Context, listenConfig *ListenConfig, quiet bool) error {
 	logger = newCustomLogger()
 	logger.quiet = quiet
 
 	if listenConfig.ServerAddress != "" {
-		err := forward(listenConfig)
+		err := forward(ctx, listenConfig)
 		if err != nil {
 			return err
 		}
 	} else if listenConfig.ServerCertFile != "" {
-		err := proxy(listenConfig)
+		err := proxy(ctx, listenConfig)
 		if err != nil {
 			return err
 		}

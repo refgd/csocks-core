@@ -2,25 +2,20 @@ package csocks
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
 	"io"
 	"net"
-	"os"
 	"time"
 )
 
-func forward(listenConfig *ListenConfig) error {
-	pemBytes, err := os.ReadFile("public.key")
+func forward(ctx context.Context, listenConfig *ListenConfig) error {
+	knownPubKey, err := loadKnownPublicKey(listenConfig.PublicKeyFile)
 	if err != nil {
 		return err
-	}
-
-	block, _ := pem.Decode(pemBytes)
-	if block == nil || block.Type != "PUBLIC KEY" {
-		return errors.New("failed to parse public key")
 	}
 
 	ln, err := listen(listenConfig.ListenPort)
@@ -28,101 +23,141 @@ func forward(listenConfig *ListenConfig) error {
 		return err
 	}
 
+	go func() {
+		<-ctx.Done()
+		_ = ln.Close()
+	}()
+
 	logger.Printf("[*] listen on: [%s %s] server on: [%s]\n", ln.Addr().Network(), ln.Addr().String(), listenConfig.ServerAddress)
+
 	for {
 		logger.PrintfX("[*] waiting for client to connect [%s %s]\n", ln.Addr().Network(), ln.Addr().String())
 		conn0, err := ln.Accept()
 		if err != nil {
+			if ctx.Err() != nil {
+				logger.PrintfX("[*] forward stopped\n")
+				return nil
+			}
 			logger.Printf("[x] accept error [%s]\n", err.Error())
 			continue
 		}
 		logger.PrintfX("[+] new client [%s] connected [%s]\n", conn0.RemoteAddr().String(), conn0.LocalAddr().String())
-
-		go handleForward(listenConfig, conn0, block.Bytes)
+		go handleForward(ctx, listenConfig, conn0, knownPubKey)
 	}
 }
 
-func handleForward(listenConfig *ListenConfig, conn0 net.Conn, publicKey []byte) {
+func loadKnownPublicKey(publicKeyFile string) ([]byte, error) {
+	pemBytes, err := loadPublicKey(publicKeyFile)
+	if err != nil {
+		return nil, err
+	}
+
+	block, _ := pem.Decode(pemBytes)
+	if block == nil || block.Type != "PUBLIC KEY" {
+		return nil, errors.New("failed to parse public key")
+	}
+
+	// Validate bytes are a real PKIX public key
+	if _, err := x509.ParsePKIXPublicKey(block.Bytes); err != nil {
+		return nil, errors.New("invalid public key file")
+	}
+
+	return block.Bytes, nil
+}
+
+func handleForward(ctx context.Context, listenConfig *ListenConfig, conn0 net.Conn, knownPubKey []byte) {
+	defer conn0.Close()
+
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn0.Close()
+		case <-done:
+		}
+	}()
+	defer close(done)
+
 	dialer := &net.Dialer{Timeout: time.Duration(timeout) * time.Second}
-	conn, err := dialer.Dial("tcp", listenConfig.ServerAddress)
+	rawConn, err := dialer.DialContext(ctx, "tcp", listenConfig.ServerAddress)
 	if err != nil {
 		logger.Printf("[x] connect [%s] error [%s]\n", listenConfig.ServerAddress, err.Error())
 		_, _ = conn0.Write([]byte(err.Error()))
 		return
 	}
+	defer rawConn.Close()
 
-	conn1 := tls.Client(conn, &tls.Config{
-		MinVersion:         tls.VersionTLS13,
-		MaxVersion:         tls.VersionTLS13,
+	tlsCfg := &tls.Config{
+		MinVersion: tls.VersionTLS13,
+		MaxVersion: tls.VersionTLS13,
+
 		InsecureSkipVerify: true,
-		VerifyPeerCertificate: func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
-			for _, rawCert := range rawCerts {
-				cert, err := x509.ParseCertificate(rawCert)
-				if err != nil {
-					return err
-				}
 
-				serverPubKeyBytes, err := x509.MarshalPKIXPublicKey(cert.PublicKey)
-				if err != nil {
-					return err
-				}
-
-				// Compare the byte slices of the public keys
-				if bytes.Equal(serverPubKeyBytes, publicKey) {
-					return nil // Public key matches, so the certificate is trusted for this connection.
-				}
+		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+			if len(rawCerts) == 0 {
+				return errors.New("no server certificate")
 			}
-
-			return errors.New("server's certificate does not match the known public key")
+			cert, err := x509.ParseCertificate(rawCerts[0]) // leaf
+			if err != nil {
+				return err
+			}
+			serverPubKeyBytes, err := x509.MarshalPKIXPublicKey(cert.PublicKey)
+			if err != nil {
+				return err
+			}
+			if !bytes.Equal(serverPubKeyBytes, knownPubKey) {
+				return errors.New("server public key mismatch")
+			}
+			return nil
 		},
-	})
+	}
 
-	err = conn1.Handshake()
-	if err != nil {
+	conn1 := tls.Client(rawConn, tlsCfg)
+	defer conn1.Close()
+
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn1.Close()
+		case <-done:
+		}
+	}()
+
+	_ = conn1.SetDeadline(time.Now().Add(time.Duration(timeout) * time.Second))
+	if err := conn1.Handshake(); err != nil {
 		logger.Printf("[x] handshake failed: [%s]\n", err.Error())
 		return
 	}
+	_ = conn1.SetDeadline(time.Time{})
 
-	_, err = conn1.Write([]byte(listenConfig.Secret + "\n"))
-	if err != nil {
-		logger.Printf("[x] Failed to send data: [%s]\n", err.Error())
+	// Send secret
+	if _, err := conn1.Write([]byte(listenConfig.Secret + "\n")); err != nil {
+		logger.Printf("[x] failed to send secret: [%s]\n", err.Error())
 		return
 	}
 
-	// Set a deadline for the read operation
-	deadline := time.Now().Add(5 * time.Second) // 5 seconds from now
-	err = conn1.SetReadDeadline(deadline)
-	if err != nil {
-		logger.Printf("[x] Failed to set read deadline: [%s]\n", err.Error())
+	if err := readAuthReply(conn1, 5*time.Second); err != nil {
+		logger.PrintfX("[x] authentication reply error: [%s]\n", err.Error())
 		return
 	}
 
-	buf := make([]byte, 1)
-	_, err = conn1.Read(buf)
-	if err != nil {
-		if err == io.EOF {
-			logger.PrintfX("[x] Connection closed by server\n")
-		} else if nErr, ok := err.(net.Error); ok && nErr.Timeout() {
-			logger.PrintfX("[x] Read timed out: no response from server\n")
-		} else {
-			logger.PrintfX("[x] Error reading from server: [%s]\n", err.Error())
-		}
-		return
-	}
-
-	if buf[0] != replySuccess {
-		logger.Printf("[x] Authentication failed.\n")
-		return
-	}
-
-	// Reset the deadline (if further operations are expected)
-	err = conn1.SetReadDeadline(time.Time{}) // Zero value disables the deadline
-	if err != nil {
-		logger.PrintfX("[x] Failed to clear read deadline: [%s]\n", err.Error())
-		return
-	}
-
-	mutualCopyIO(conn0, conn1)
+	mutualCopyIO(ctx, conn0, conn1)
 
 	logger.PrintfX("[-] client [%s] disconnected\n", conn0.RemoteAddr().String())
+}
+
+func readAuthReply(c net.Conn, timeout time.Duration) error {
+	if err := c.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		return err
+	}
+	defer func() { _ = c.SetReadDeadline(time.Time{}) }()
+
+	var b [1]byte
+	if _, err := io.ReadFull(c, b[:]); err != nil {
+		return err
+	}
+	if b[0] != replySuccess {
+		return errors.New("authentication failed")
+	}
+	return nil
 }
