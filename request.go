@@ -22,10 +22,7 @@ import (
 	"golang.org/x/net/http2"
 )
 
-var (
-	tlsConfig *tls.Config
-	replayMap = newNonceReplayCache()
-)
+var replayMap = newNonceReplayCache()
 
 type negotiationRequest struct {
 	net.Conn
@@ -173,24 +170,24 @@ func (c *nonceReplayCache) SeenOrAdd(nonce string, ttl time.Duration) bool {
 	return false
 }
 
-func setTLSConfig(serverCertFile, serverKeyFile, publicKeyFile string) error {
+func newServerTLSConfig(serverCertFile, serverKeyFile, publicKeyFile string) (*tls.Config, error) {
 	cert, err := tls.LoadX509KeyPair(serverCertFile, serverKeyFile)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	if len(cert.Certificate) == 0 {
-		return errors.New("no certificates found")
+		return nil, errors.New("no certificates found")
 	}
 
 	x509Cert, err := x509.ParseCertificate(cert.Certificate[0])
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	publicKeyBytes, err := x509.MarshalPKIXPublicKey(x509Cert.PublicKey)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	pemBytes := pem.EncodeToMemory(&pem.Block{
@@ -203,25 +200,24 @@ func setTLSConfig(serverCertFile, serverKeyFile, publicKeyFile string) error {
 	}
 
 	if err := os.WriteFile(publicKeyFile, pemBytes, 0644); err != nil {
-		return err
+		return nil, err
 	}
 
-	tlsConfig = &tls.Config{
+	return &tls.Config{
 		Certificates: []tls.Certificate{cert},
 		MinVersion:   tls.VersionTLS12,
 		MaxVersion:   tls.VersionTLS13,
 		NextProtos:   []string{protoH2, protoHTTP1},
-	}
-
-	return nil
+	}, nil
 }
 
 func proxy(ctx context.Context, listenConfig *ListenConfig) error {
-	if err := setTLSConfig(
+	tlsCfg, err := newServerTLSConfig(
 		listenConfig.ServerCertFile,
 		listenConfig.ServerKeyFile,
 		listenConfig.PublicKeyFile,
-	); err != nil {
+	)
+	if err != nil {
 		return err
 	}
 
@@ -236,9 +232,9 @@ func proxy(ctx context.Context, listenConfig *ListenConfig) error {
 	}()
 
 	if listenConfig.WithHttp {
-		logger.Printf("[*] h2/http1 fallback & socks5/http proxy listen on: [%s]", listenConfig.ListenPort)
+		logger.Printf("[*] socks5/http proxy listen on: [%s]", listenConfig.ListenPort)
 	} else {
-		logger.Printf("[*] h2/http1 fallback & socks5 proxy listen on: [%s]", listenConfig.ListenPort)
+		logger.Printf("[*] socks5 proxy listen on: [%s]", listenConfig.ListenPort)
 	}
 
 	for {
@@ -257,11 +253,11 @@ func proxy(ctx context.Context, listenConfig *ListenConfig) error {
 			conn0.LocalAddr().String(),
 		)
 
-		go handleRequest(ctx, conn0, listenConfig)
+		go handleRequest(ctx, conn0, listenConfig, tlsCfg)
 	}
 }
 
-func handleRequest(ctx context.Context, conn0 net.Conn, listenConfig *ListenConfig) {
+func handleRequest(ctx context.Context, conn0 net.Conn, listenConfig *ListenConfig, tlsCfg *tls.Config) {
 	defer conn0.Close()
 
 	reader := bufio.NewReader(conn0)
@@ -294,7 +290,7 @@ func handleRequest(ctx context.Context, conn0 net.Conn, listenConfig *ListenConf
 	tlsConn, err := tlsHandshake(&sniffedConn{
 		Conn:   conn0,
 		reader: reader,
-	})
+	}, tlsCfg)
 	if err != nil {
 		logger.PrintfX("[x] failed to handshake: [%s]\n", err.Error())
 		return
@@ -349,8 +345,8 @@ func handlePlainHTTPFallback(conn net.Conn, reader *bufio.Reader) {
 	writeFallbackHTTP(conn, req)
 }
 
-func tlsHandshake(conn0 net.Conn) (*tls.Conn, error) {
-	tlsConn := tls.Server(conn0, tlsConfig)
+func tlsHandshake(conn0 net.Conn, tlsCfg *tls.Config) (*tls.Conn, error) {
+	tlsConn := tls.Server(conn0, tlsCfg)
 
 	if err := tlsConn.SetDeadline(time.Now().Add(time.Duration(timeout) * time.Second)); err != nil {
 		return nil, err
@@ -457,8 +453,13 @@ func handleH2Conn(ctx context.Context, tlsConn *tls.Conn, listenConfig *ListenCo
 	})
 
 	server := &http2.Server{
-		MaxConcurrentStreams: 128,
-		IdleTimeout:          90 * time.Second,
+		MaxConcurrentStreams: maxClientH2Streams,
+
+		// 不做运行时健康检查。空闲连接由 IdleTimeout 关闭。
+		IdleTimeout: 30 * time.Second,
+
+		MaxUploadBufferPerConnection: 1 << 20,
+		MaxUploadBufferPerStream:     256 << 10,
 	}
 
 	server.ServeConn(tlsConn, &http2.ServeConnOpts{

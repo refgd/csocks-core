@@ -148,8 +148,7 @@ func handleHttp(ctx context.Context, w http.ResponseWriter, req *http.Request) {
 		outReq.URL.Host = outReq.Host
 	}
 
-	outReq.Header.Del("Proxy-Connection")
-	outReq.Header.Del("Connection")
+	cleanProxyHeaders(outReq.Header)
 
 	resp, err := http.DefaultTransport.RoundTrip(outReq)
 	if err != nil {
@@ -159,6 +158,8 @@ func handleHttp(ctx context.Context, w http.ResponseWriter, req *http.Request) {
 
 	defer resp.Body.Close()
 
+	cleanProxyHeaders(resp.Header)
+
 	for k, vv := range resp.Header {
 		for _, v := range vv {
 			w.Header().Add(k, v)
@@ -167,4 +168,16 @@ func handleHttp(ctx context.Context, w http.ResponseWriter, req *http.Request) {
 
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
+}
+
+func cleanProxyHeaders(h http.Header) {
+	h.Del("Proxy-Connection")
+	h.Del("Connection")
+	h.Del("Keep-Alive")
+	h.Del("Proxy-Authenticate")
+	h.Del("Proxy-Authorization")
+	h.Del("TE")
+	h.Del("Trailer")
+	h.Del("Transfer-Encoding")
+	h.Del("Upgrade")
 }

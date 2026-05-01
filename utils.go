@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -21,7 +22,7 @@ const (
 	methodHttp   byte = 0x01
 
 	timeout int = 10
-	Version     = "v0.0.1"
+	Version     = "v0.0.3"
 
 	protoH2    = "h2"
 	protoHTTP1 = "http/1.1"
@@ -34,6 +35,8 @@ const (
 	headerRequestSignature = "X-Request-Signature"
 
 	authClockSkewSeconds = 120
+
+	maxClientH2Streams = 64
 )
 
 type deadlineConn struct {
@@ -220,4 +223,53 @@ func headerContainsToken(v, token string) bool {
 		}
 	}
 	return false
+}
+
+type TunnelStatsSnapshot struct {
+	ActiveStreams int64
+	TotalStreams  uint64
+	FailedStreams uint64
+	BytesUp       uint64
+	BytesDown     uint64
+}
+
+type tunnelStats struct {
+	activeStreams int64
+	totalStreams  uint64
+	failedStreams uint64
+	bytesUp       uint64
+	bytesDown     uint64
+}
+
+var globalTunnelStats tunnelStats
+
+func GetTunnelStats() TunnelStatsSnapshot {
+	return TunnelStatsSnapshot{
+		ActiveStreams: atomic.LoadInt64(&globalTunnelStats.activeStreams),
+		TotalStreams:  atomic.LoadUint64(&globalTunnelStats.totalStreams),
+		FailedStreams: atomic.LoadUint64(&globalTunnelStats.failedStreams),
+		BytesUp:       atomic.LoadUint64(&globalTunnelStats.bytesUp),
+		BytesDown:     atomic.LoadUint64(&globalTunnelStats.bytesDown),
+	}
+}
+
+func recordStreamStart() {
+	atomic.AddInt64(&globalTunnelStats.activeStreams, 1)
+	atomic.AddUint64(&globalTunnelStats.totalStreams, 1)
+}
+
+func recordStreamEnd() {
+	atomic.AddInt64(&globalTunnelStats.activeStreams, -1)
+}
+
+func recordStreamFail() {
+	atomic.AddUint64(&globalTunnelStats.failedStreams, 1)
+}
+
+func recordBytesUp(n uint64) {
+	atomic.AddUint64(&globalTunnelStats.bytesUp, n)
+}
+
+func recordBytesDown(n uint64) {
+	atomic.AddUint64(&globalTunnelStats.bytesDown, n)
 }
