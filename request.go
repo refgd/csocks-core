@@ -18,6 +18,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/net/http2"
 )
 
 var (
@@ -42,6 +44,102 @@ func (c *sniffedConn) Read(p []byte) (int, error) {
 		return c.reader.Read(p)
 	}
 	return c.Conn.Read(p)
+}
+
+type dummyAddr string
+
+func (a dummyAddr) Network() string {
+	return "h2"
+}
+
+func (a dummyAddr) String() string {
+	return string(a)
+}
+
+type h2StreamConn struct {
+	ctx     context.Context
+	cancel  context.CancelFunc
+	reader  io.Reader
+	writer  io.Writer
+	flusher http.Flusher
+	remote  string
+	writeMu sync.Mutex
+}
+
+func newH2StreamConn(
+	ctx context.Context,
+	reader io.Reader,
+	writer io.Writer,
+	flusher http.Flusher,
+	remote string,
+) *h2StreamConn {
+	streamCtx, cancel := context.WithCancel(ctx)
+
+	return &h2StreamConn{
+		ctx:     streamCtx,
+		cancel:  cancel,
+		reader:  reader,
+		writer:  writer,
+		flusher: flusher,
+		remote:  remote,
+	}
+}
+
+func (c *h2StreamConn) Read(p []byte) (int, error) {
+	select {
+	case <-c.ctx.Done():
+		return 0, c.ctx.Err()
+	default:
+		return c.reader.Read(p)
+	}
+}
+
+func (c *h2StreamConn) Write(p []byte) (int, error) {
+	select {
+	case <-c.ctx.Done():
+		return 0, c.ctx.Err()
+	default:
+	}
+
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+
+	n, err := c.writer.Write(p)
+	if c.flusher != nil {
+		c.flusher.Flush()
+	}
+
+	return n, err
+}
+
+func (c *h2StreamConn) Close() error {
+	if c.cancel != nil {
+		c.cancel()
+	}
+	return nil
+}
+
+func (c *h2StreamConn) LocalAddr() net.Addr {
+	return dummyAddr("h2-local")
+}
+
+func (c *h2StreamConn) RemoteAddr() net.Addr {
+	if c.remote == "" {
+		return dummyAddr("h2-remote")
+	}
+	return dummyAddr(c.remote)
+}
+
+func (c *h2StreamConn) SetDeadline(time.Time) error {
+	return nil
+}
+
+func (c *h2StreamConn) SetReadDeadline(time.Time) error {
+	return nil
+}
+
+func (c *h2StreamConn) SetWriteDeadline(time.Time) error {
+	return nil
 }
 
 type nonceReplayCache struct {
@@ -80,6 +178,7 @@ func setTLSConfig(serverCertFile, serverKeyFile, publicKeyFile string) error {
 	if err != nil {
 		return err
 	}
+
 	if len(cert.Certificate) == 0 {
 		return errors.New("no certificates found")
 	}
@@ -102,6 +201,7 @@ func setTLSConfig(serverCertFile, serverKeyFile, publicKeyFile string) error {
 	if strings.TrimSpace(publicKeyFile) == "" {
 		publicKeyFile = "public.key"
 	}
+
 	if err := os.WriteFile(publicKeyFile, pemBytes, 0644); err != nil {
 		return err
 	}
@@ -110,10 +210,7 @@ func setTLSConfig(serverCertFile, serverKeyFile, publicKeyFile string) error {
 		Certificates: []tls.Certificate{cert},
 		MinVersion:   tls.VersionTLS12,
 		MaxVersion:   tls.VersionTLS13,
-
-		// 第一阶段只走 HTTP/1.1 Upgrade。
-		// 不要加 h2，否则客户端发 HTTP/1.1 文本时可能和 ALPN 协商结果不一致。
-		NextProtos: []string{"http/1.1"},
+		NextProtos:   []string{protoH2, protoHTTP1},
 	}
 
 	return nil
@@ -139,17 +236,12 @@ func proxy(ctx context.Context, listenConfig *ListenConfig) error {
 	}()
 
 	if listenConfig.WithHttp {
-		logger.Printf("[*] https/http fallback & socks5/http proxy listen on: [%s]", listenConfig.ListenPort)
+		logger.Printf("[*] h2/http1 fallback & socks5/http proxy listen on: [%s]", listenConfig.ListenPort)
 	} else {
-		logger.Printf("[*] https/http fallback & socks5 proxy listen on: [%s]", listenConfig.ListenPort)
+		logger.Printf("[*] h2/http1 fallback & socks5 proxy listen on: [%s]", listenConfig.ListenPort)
 	}
 
 	for {
-		logger.PrintfX("[*] waiting for client to connect [%s %s]\n",
-			ln.Addr().Network(),
-			ln.Addr().String(),
-		)
-
 		conn0, err := ln.Accept()
 		if err != nil {
 			if ctx.Err() != nil {
@@ -174,9 +266,6 @@ func handleRequest(ctx context.Context, conn0 net.Conn, listenConfig *ListenConf
 
 	reader := bufio.NewReader(conn0)
 
-	// 同端口识别：
-	// - TLS ClientHello 第一个字节通常是 0x16
-	// - 明文 HTTP 第一个字节通常是 G/P/H/O/D/T/C
 	_ = conn0.SetReadDeadline(time.Now().Add(3 * time.Second))
 	first, err := reader.Peek(1)
 	_ = conn0.SetReadDeadline(time.Time{})
@@ -207,49 +296,23 @@ func handleRequest(ctx context.Context, conn0 net.Conn, listenConfig *ListenConf
 		reader: reader,
 	})
 	if err != nil {
-		logger.PrintfX("[x] Failed to handshake: [%s]\n", err.Error())
+		logger.PrintfX("[x] failed to handshake: [%s]\n", err.Error())
 		return
 	}
+
 	defer tlsConn.Close()
 
-	done := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = tlsConn.Close()
-		case <-done:
-		}
-	}()
-	defer close(done)
+	state := tlsConn.ConnectionState()
 
-	reader, ok, err := authRequest(tlsConn, listenConfig)
-	if err != nil {
-		logger.PrintfX("[x] auth/http request read failed from [%s]: [%s]\n",
-			tlsConn.RemoteAddr().String(),
-			err.Error(),
-		)
-		return
-	}
+	switch state.NegotiatedProtocol {
+	case protoH2:
+		handleH2Conn(ctx, tlsConn, listenConfig)
 
-	if !ok {
-		return
-	}
+	case protoHTTP1, "":
+		handleHTTP1Conn(ctx, tlsConn, listenConfig)
 
-	negReq, err := parseRequest(tlsConn, reader, listenConfig.WithHttp)
-	if err != nil {
-		if err != io.EOF {
-			logger.Printf("[x] parse request error [%s]\n", err.Error())
-		}
-		return
-	}
-
-	switch negReq.Method {
-	case methodSocks5:
-		handleSocks5(ctx, negReq)
-	case methodHttp:
-		handleHttpRequest(ctx, negReq)
 	default:
-		_ = negReq.Conn.Close()
+		logger.PrintfX("[x] unsupported ALPN protocol: [%s]\n", state.NegotiatedProtocol)
 	}
 }
 
@@ -280,6 +343,7 @@ func handlePlainHTTPFallback(conn net.Conn, reader *bufio.Reader) {
 		)
 		return
 	}
+
 	defer req.Body.Close()
 
 	writeFallbackHTTP(conn, req)
@@ -291,20 +355,72 @@ func tlsHandshake(conn0 net.Conn) (*tls.Conn, error) {
 	if err := tlsConn.SetDeadline(time.Now().Add(time.Duration(timeout) * time.Second)); err != nil {
 		return nil, err
 	}
+
 	if err := tlsConn.Handshake(); err != nil {
 		return nil, err
 	}
+
 	if err := tlsConn.SetDeadline(time.Time{}); err != nil {
 		return nil, err
 	}
 
 	state := tlsConn.ConnectionState()
-	logger.PrintfX("[*] TLS version used: %d\n", state.Version)
+
+	logger.PrintfX("[*] TLS version used: %d, ALPN: %s\n",
+		state.Version,
+		state.NegotiatedProtocol,
+	)
 
 	return tlsConn, nil
 }
 
-func authRequest(tlsConn *tls.Conn, listenConfig *ListenConfig) (*bufio.Reader, bool, error) {
+func handleHTTP1Conn(ctx context.Context, tlsConn *tls.Conn, listenConfig *ListenConfig) {
+	done := make(chan struct{})
+
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = tlsConn.Close()
+		case <-done:
+		}
+	}()
+
+	defer close(done)
+
+	reader, ok, err := authHTTP1Request(tlsConn, listenConfig)
+	if err != nil {
+		logger.PrintfX("[x] http1 auth/read failed from [%s]: [%s]\n",
+			tlsConn.RemoteAddr().String(),
+			err.Error(),
+		)
+		return
+	}
+
+	if !ok {
+		return
+	}
+
+	negReq, err := parseRequest(tlsConn, reader, listenConfig.WithHttp)
+	if err != nil {
+		if err != io.EOF {
+			logger.Printf("[x] parse request error [%s]\n", err.Error())
+		}
+		return
+	}
+
+	switch negReq.Method {
+	case methodSocks5:
+		handleSocks5(ctx, negReq)
+
+	case methodHttp:
+		handleHttpRequest(ctx, negReq)
+
+	default:
+		_ = negReq.Conn.Close()
+	}
+}
+
+func authHTTP1Request(tlsConn *tls.Conn, listenConfig *ListenConfig) (*bufio.Reader, bool, error) {
 	reader := bufio.NewReader(tlsConn)
 
 	_ = tlsConn.SetReadDeadline(time.Now().Add(8 * time.Second))
@@ -314,9 +430,10 @@ func authRequest(tlsConn *tls.Conn, listenConfig *ListenConfig) (*bufio.Reader, 
 	if err != nil {
 		return reader, false, err
 	}
+
 	defer req.Body.Close()
 
-	if !validateTunnelRequest(req, listenConfig) {
+	if !validateHTTP1TunnelRequest(req, listenConfig) {
 		writeFallbackHTTP(tlsConn, req)
 		return reader, false, nil
 	}
@@ -334,7 +451,91 @@ func authRequest(tlsConn *tls.Conn, listenConfig *ListenConfig) (*bufio.Reader, 
 	return reader, true, nil
 }
 
-func validateTunnelRequest(req *http.Request, listenConfig *ListenConfig) bool {
+func handleH2Conn(ctx context.Context, tlsConn *tls.Conn, listenConfig *ListenConfig) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handleH2Request(ctx, listenConfig, w, r)
+	})
+
+	server := &http2.Server{
+		MaxConcurrentStreams: 128,
+		IdleTimeout:          90 * time.Second,
+	}
+
+	server.ServeConn(tlsConn, &http2.ServeConnOpts{
+		Handler: handler,
+	})
+}
+
+func handleH2Request(
+	ctx context.Context,
+	listenConfig *ListenConfig,
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	if r.URL == nil || r.URL.Path != tunnelPath {
+		writeFallbackHTTPResponse(w, r)
+		return
+	}
+
+	if !validateH2TunnelRequest(r, listenConfig) {
+		writeFallbackHTTPResponse(w, r)
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	streamCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	go func() {
+		select {
+		case <-r.Context().Done():
+			cancel()
+		case <-streamCtx.Done():
+		}
+	}()
+
+	streamConn := newH2StreamConn(
+		streamCtx,
+		r.Body,
+		w,
+		flusher,
+		r.RemoteAddr,
+	)
+
+	defer streamConn.Close()
+	defer r.Body.Close()
+
+	negReq, err := parseRequest(streamConn, bufio.NewReader(streamConn), listenConfig.WithHttp)
+	if err != nil {
+		if err != io.EOF {
+			logger.PrintfX("[x] h2 parse request error: [%s]\n", err.Error())
+		}
+		return
+	}
+
+	switch negReq.Method {
+	case methodSocks5:
+		handleSocks5(streamCtx, negReq)
+
+	case methodHttp:
+		handleHttpRequest(streamCtx, negReq)
+
+	default:
+		_ = negReq.Conn.Close()
+	}
+}
+
+func validateHTTP1TunnelRequest(req *http.Request, listenConfig *ListenConfig) bool {
 	if req.Method != http.MethodGet {
 		return false
 	}
@@ -351,6 +552,31 @@ func validateTunnelRequest(req *http.Request, listenConfig *ListenConfig) bool {
 		return false
 	}
 
+	return validateTunnelSignature(req, listenConfig, protoHTTP1, true)
+}
+
+func validateH2TunnelRequest(req *http.Request, listenConfig *ListenConfig) bool {
+	if req.ProtoMajor != 2 {
+		return false
+	}
+
+	if req.Method != http.MethodPost {
+		return false
+	}
+
+	if req.URL == nil || req.URL.Path != tunnelPath {
+		return false
+	}
+
+	return validateTunnelSignature(req, listenConfig, protoH2, false)
+}
+
+func validateTunnelSignature(
+	req *http.Request,
+	listenConfig *ListenConfig,
+	proto string,
+	allowLegacy bool,
+) bool {
 	nonce := strings.TrimSpace(req.Header.Get(headerSessionID))
 	if nonce == "" || len(nonce) > 128 {
 		return false
@@ -367,24 +593,44 @@ func validateTunnelRequest(req *http.Request, listenConfig *ListenConfig) bool {
 		return false
 	}
 
-	if replayMap.SeenOrAdd(nonce, time.Duration(authClockSkewSeconds)*time.Second) {
-		return false
-	}
-
 	gotSig := strings.TrimSpace(req.Header.Get(headerRequestSignature))
 	if gotSig == "" || len(gotSig) > 256 {
 		return false
 	}
 
-	expectedSig := makeTunnelAuthSignature(
+	expectedV2 := makeTunnelAuthSignatureV2(
 		listenConfig.Secret,
+		req.Method,
 		req.URL.Path,
 		req.Host,
 		nonce,
 		ts,
+		proto,
 	)
 
-	return subtle.ConstantTimeCompare([]byte(gotSig), []byte(expectedSig)) == 1
+	valid := subtle.ConstantTimeCompare([]byte(gotSig), []byte(expectedV2)) == 1
+
+	if !valid && allowLegacy {
+		expectedV1 := makeTunnelAuthSignature(
+			listenConfig.Secret,
+			req.URL.Path,
+			req.Host,
+			nonce,
+			ts,
+		)
+
+		valid = subtle.ConstantTimeCompare([]byte(gotSig), []byte(expectedV1)) == 1
+	}
+
+	if !valid {
+		return false
+	}
+
+	if replayMap.SeenOrAdd(nonce, time.Duration(authClockSkewSeconds)*time.Second) {
+		return false
+	}
+
+	return true
 }
 
 func writeFallbackHTTP(conn net.Conn, req *http.Request) {
@@ -402,6 +648,7 @@ func writeFallbackHTTP(conn net.Conn, req *http.Request) {
 			"Cache-Control: public, max-age=86400\r\n" +
 			"Connection: close\r\n" +
 			"\r\n"
+
 		_, _ = conn.Write([]byte(resp))
 		return
 	}
@@ -429,6 +676,34 @@ func writeFallbackHTTP(conn net.Conn, req *http.Request) {
 	_, _ = conn.Write([]byte(resp))
 }
 
+func writeFallbackHTTPResponse(w http.ResponseWriter, req *http.Request) {
+	path := "/"
+	if req != nil && req.URL != nil {
+		path = req.URL.Path
+	}
+
+	if path == "/favicon.ico" {
+		w.Header().Set("Cache-Control", "public, max-age=86400")
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	body := "<!doctype html><html><head><meta charset=\"utf-8\"><title>Welcome</title></head><body><h1>Welcome</h1></body></html>"
+
+	if path != "/" && path != "/index.html" {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte("<!doctype html><html><head><meta charset=\"utf-8\"><title>Not Found</title></head><body><h1>404 Not Found</h1></body></html>"))
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(body))
+}
+
 func parseRequest(c net.Conn, r *bufio.Reader, withHttp bool) (*negotiationRequest, error) {
 	if r == nil {
 		r = bufio.NewReader(c)
@@ -441,9 +716,11 @@ func parseRequest(c net.Conn, r *bufio.Reader, withHttp bool) (*negotiationReque
 
 	if b0[0] == 0x05 {
 		var hdr [2]byte
+
 		if _, err := io.ReadFull(r, hdr[:]); err != nil {
 			return nil, err
 		}
+
 		if hdr[0] != 0x05 {
 			return nil, errors.New("invalid socks5 version")
 		}
@@ -454,11 +731,13 @@ func parseRequest(c net.Conn, r *bufio.Reader, withHttp bool) (*negotiationReque
 		}
 
 		methods := make([]byte, nMethods)
+
 		if _, err := io.ReadFull(r, methods); err != nil {
 			return nil, err
 		}
 
 		hasNoAuth := false
+
 		for _, m := range methods {
 			if m == 0x00 {
 				hasNoAuth = true
@@ -476,6 +755,7 @@ func parseRequest(c net.Conn, r *bufio.Reader, withHttp bool) (*negotiationReque
 		}
 
 		var reqHdr [4]byte
+
 		if _, err := io.ReadFull(r, reqHdr[:]); err != nil {
 			return nil, err
 		}
@@ -495,16 +775,20 @@ func parseRequest(c net.Conn, r *bufio.Reader, withHttp bool) (*negotiationReque
 		switch atyp {
 		case 0x01:
 			var addr [4]byte
+
 			if _, err := io.ReadFull(r, addr[:]); err != nil {
 				return nil, err
 			}
+
 			host = net.IP(addr[:]).String()
 
 		case 0x04:
 			var addr [16]byte
+
 			if _, err := io.ReadFull(r, addr[:]); err != nil {
 				return nil, err
 			}
+
 			host = net.IP(addr[:]).String()
 
 		case 0x03:
@@ -519,9 +803,11 @@ func parseRequest(c net.Conn, r *bufio.Reader, withHttp bool) (*negotiationReque
 			}
 
 			domain := make([]byte, l)
+
 			if _, err := io.ReadFull(r, domain); err != nil {
 				return nil, err
 			}
+
 			host = string(domain)
 
 		default:
@@ -530,6 +816,7 @@ func parseRequest(c net.Conn, r *bufio.Reader, withHttp bool) (*negotiationReque
 		}
 
 		var pb [2]byte
+
 		if _, err := io.ReadFull(r, pb[:]); err != nil {
 			return nil, err
 		}
@@ -561,6 +848,7 @@ func handleSocks5(ctx context.Context, negotiationRequest *negotiationRequest) {
 			negotiationRequest.Address,
 			err.Error(),
 		)
+
 		writeSocks5Reply(negotiationRequest.Conn, 0x05)
 		return
 	}

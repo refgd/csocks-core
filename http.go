@@ -18,8 +18,15 @@ type connListener struct {
 
 func newConnListener(conn net.Conn, reader *bufio.Reader) net.Listener {
 	ch := make(chan net.Conn, 1)
-	ch <- &readConn{Conn: conn, reader: reader}
-	return &connListener{addr: conn.LocalAddr(), ch: ch}
+	ch <- &readConn{
+		Conn:   conn,
+		reader: reader,
+	}
+
+	return &connListener{
+		addr: conn.LocalAddr(),
+		ch:   ch,
+	}
 }
 
 func (l *connListener) Accept() (net.Conn, error) {
@@ -27,11 +34,17 @@ func (l *connListener) Accept() (net.Conn, error) {
 	if !ok || conn == nil {
 		return nil, io.EOF
 	}
-	return &connCloser{l: l, Conn: conn}, nil
+
+	return &connCloser{
+		l:    l,
+		Conn: conn,
+	}, nil
 }
 
 func (l *connListener) shutdown() {
-	l.once.Do(func() { close(l.ch) })
+	l.once.Do(func() {
+		close(l.ch)
+	})
 }
 
 func (l *connListener) Close() error {
@@ -63,6 +76,7 @@ func (c *readConn) Read(b []byte) (int, error) {
 	if c.readOnce {
 		return c.Conn.Read(b)
 	}
+
 	c.readOnce = true
 	return c.reader.Read(b)
 }
@@ -71,6 +85,7 @@ func handleHttpRequest(ctx context.Context, negotiationRequest *negotiationReque
 	defer negotiationRequest.Conn.Close()
 
 	done := make(chan struct{})
+
 	go func() {
 		select {
 		case <-ctx.Done():
@@ -78,6 +93,7 @@ func handleHttpRequest(ctx context.Context, negotiationRequest *negotiationReque
 		case <-done:
 		}
 	}()
+
 	defer close(done)
 
 	err := http.Serve(negotiationRequest.Listener, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -85,6 +101,7 @@ func handleHttpRequest(ctx context.Context, negotiationRequest *negotiationReque
 			handleTunneling(ctx, w, r)
 			return
 		}
+
 		handleHttp(ctx, w, r)
 	}))
 
@@ -103,7 +120,7 @@ func handleTunneling(ctx context.Context, w http.ResponseWriter, r *http.Request
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
 		_ = remoteConn.Close()
-		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+		http.Error(w, "service unavailable", http.StatusInternalServerError)
 		return
 	}
 
@@ -126,6 +143,7 @@ func handleHttp(ctx context.Context, w http.ResponseWriter, req *http.Request) {
 	if outReq.URL.Scheme == "" {
 		outReq.URL.Scheme = "http"
 	}
+
 	if outReq.URL.Host == "" {
 		outReq.URL.Host = outReq.Host
 	}
@@ -138,6 +156,7 @@ func handleHttp(ctx context.Context, w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
 		return
 	}
+
 	defer resp.Body.Close()
 
 	for k, vv := range resp.Header {

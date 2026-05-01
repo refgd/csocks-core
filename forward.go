@@ -11,10 +11,28 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
+
+	"golang.org/x/net/http2"
 )
+
+type forwardProtocol byte
+
+const (
+	forwardProtocolH2 forwardProtocol = iota + 1
+	forwardProtocolHTTP1
+)
+
+type forwardRuntime struct {
+	protocol forwardProtocol
+	h2Client *http.Client
+	h1TLSCfg *tls.Config
+}
 
 func forward(ctx context.Context, listenConfig *ListenConfig) error {
 	knownPubKey, err := loadKnownPublicKey(listenConfig.PublicKeyFile)
@@ -23,19 +41,27 @@ func forward(ctx context.Context, listenConfig *ListenConfig) error {
 	}
 
 	sessionCache := tls.NewLRUClientSessionCache(128)
-	tlsCfg := newForwardTLSClientConfig(
+
+	h2TLSCfg := newForwardTLSClientConfig(
 		knownPubKey,
 		sessionCache,
 		listenConfig.ServerAddress,
+		[]string{protoH2, protoHTTP1},
 	)
 
-	// Optional warm-up: make one authenticated tunnel handshake first,
-	// so later connections have a better chance to use TLS session resumption.
-	if err := bootstrapTunnelSession(ctx, listenConfig, tlsCfg); err != nil {
+	h1TLSCfg := newForwardTLSClientConfig(
+		knownPubKey,
+		sessionCache,
+		listenConfig.ServerAddress,
+		[]string{protoHTTP1},
+	)
+
+	runtime, err := bootstrapForwardRuntime(ctx, listenConfig, h2TLSCfg, h1TLSCfg)
+	if err != nil {
 		if ctx.Err() != nil {
 			return nil
 		}
-		return fmt.Errorf("bootstrap tunnel session failed: %w", err)
+		return err
 	}
 
 	ln, err := listen(listenConfig.ListenPort)
@@ -48,6 +74,13 @@ func forward(ctx context.Context, listenConfig *ListenConfig) error {
 		_ = ln.Close()
 	}()
 
+	switch runtime.protocol {
+	case forwardProtocolH2:
+		logger.Printf("[*] forward protocol: HTTP/2 streaming tunnel\n")
+	case forwardProtocolHTTP1:
+		logger.Printf("[*] forward protocol: HTTP/1.1 upgrade fallback\n")
+	}
+
 	logger.Printf("[*] listen on: [%s %s] server on: [%s]\n",
 		ln.Addr().Network(),
 		ln.Addr().String(),
@@ -55,11 +88,6 @@ func forward(ctx context.Context, listenConfig *ListenConfig) error {
 	)
 
 	for {
-		logger.PrintfX("[*] waiting for client to connect [%s %s]\n",
-			ln.Addr().Network(),
-			ln.Addr().String(),
-		)
-
 		conn0, err := ln.Accept()
 		if err != nil {
 			if ctx.Err() != nil {
@@ -75,8 +103,52 @@ func forward(ctx context.Context, listenConfig *ListenConfig) error {
 			conn0.LocalAddr().String(),
 		)
 
-		go handleForward(ctx, listenConfig, conn0, tlsCfg)
+		switch runtime.protocol {
+		case forwardProtocolH2:
+			go handleForwardH2(ctx, listenConfig, conn0, runtime.h2Client)
+
+		case forwardProtocolHTTP1:
+			go handleForwardHTTP1(ctx, listenConfig, conn0, runtime.h1TLSCfg)
+
+		default:
+			_ = conn0.Close()
+		}
 	}
+}
+
+func bootstrapForwardRuntime(
+	ctx context.Context,
+	listenConfig *ListenConfig,
+	h2TLSCfg *tls.Config,
+	h1TLSCfg *tls.Config,
+) (*forwardRuntime, error) {
+	h2Client, err := newH2Client(h2TLSCfg)
+	if err == nil {
+		if err := bootstrapH2TunnelSession(ctx, listenConfig, h2Client); err == nil {
+			return &forwardRuntime{
+				protocol: forwardProtocolH2,
+				h2Client: h2Client,
+				h1TLSCfg: h1TLSCfg,
+			}, nil
+		} else {
+			logger.PrintfX("[x] h2 bootstrap failed: [%s]\n", err.Error())
+		}
+	} else {
+		logger.PrintfX("[x] h2 client init failed: [%s]\n", err.Error())
+	}
+
+	if err := bootstrapHTTP1TunnelSession(ctx, listenConfig, h1TLSCfg); err != nil {
+		if ctx.Err() != nil {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("server bootstrap check failed: %w", err)
+	}
+
+	return &forwardRuntime{
+		protocol: forwardProtocolHTTP1,
+		h2Client: h2Client,
+		h1TLSCfg: h1TLSCfg,
+	}, nil
 }
 
 func loadKnownPublicKey(publicKeyFile string) ([]byte, error) {
@@ -101,25 +173,18 @@ func newForwardTLSClientConfig(
 	knownPubKey []byte,
 	sessionCache tls.ClientSessionCache,
 	serverAddress string,
+	nextProtos []string,
 ) *tls.Config {
 	return &tls.Config{
-		// TLS 1.2 + 1.3 looks more normal than TLS 1.3-only.
-		// If you only want TLS 1.3, change MinVersion to tls.VersionTLS13.
 		MinVersion: tls.VersionTLS12,
 		MaxVersion: tls.VersionTLS13,
 
-		// We do SPKI pinning ourselves in VerifyConnection.
 		InsecureSkipVerify: true,
 
-		// First stage uses HTTP/1.1 Upgrade, so do not advertise h2 here.
-		NextProtos: []string{"http/1.1"},
-
+		NextProtos:         nextProtos,
 		ServerName:         serverNameFromAddress(serverAddress),
 		ClientSessionCache: sessionCache,
 
-		// Important:
-		// VerifyPeerCertificate is not called on resumed TLS sessions.
-		// VerifyConnection is called on all connections, including resumption.
 		VerifyConnection: func(state tls.ConnectionState) error {
 			if len(state.PeerCertificates) == 0 {
 				return errors.New("no server certificate")
@@ -139,7 +204,163 @@ func newForwardTLSClientConfig(
 	}
 }
 
-func handleForward(
+func newH2Client(tlsCfg *tls.Config) (*http.Client, error) {
+	tr := &http.Transport{
+		TLSClientConfig:     tlsCfg,
+		ForceAttemptHTTP2:   true,
+		MaxIdleConns:        128,
+		MaxIdleConnsPerHost: 128,
+		IdleConnTimeout:     90 * time.Second,
+	}
+
+	if err := http2.ConfigureTransport(tr); err != nil {
+		return nil, err
+	}
+
+	return &http.Client{
+		Transport: tr,
+		Timeout:   0,
+	}, nil
+}
+
+func bootstrapH2TunnelSession(
+	ctx context.Context,
+	listenConfig *ListenConfig,
+	client *http.Client,
+) error {
+	bootstrapCtx, cancel := context.WithTimeout(ctx, time.Duration(timeout)*time.Second)
+	defer cancel()
+
+	req, err := newH2TunnelRequest(bootstrapCtx, listenConfig, strings.NewReader(""))
+	if err != nil {
+		return err
+	}
+	req.ContentLength = 0
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.ProtoMajor != 2 {
+		return fmt.Errorf("server did not negotiate h2: %s", resp.Proto)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("h2 tunnel rejected: %s", resp.Status)
+	}
+
+	_, _ = io.Copy(io.Discard, resp.Body)
+
+	return nil
+}
+
+func handleForwardH2(
+	ctx context.Context,
+	listenConfig *ListenConfig,
+	conn0 net.Conn,
+	client *http.Client,
+) {
+	defer conn0.Close()
+
+	streamCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	pr, pw := io.Pipe()
+
+	req, err := newH2TunnelRequest(streamCtx, listenConfig, pr)
+	if err != nil {
+		_ = pw.CloseWithError(err)
+		_ = writeLocalProxyError(conn0)
+		return
+	}
+
+	local := newDeadlineConn(conn0, 60*time.Second)
+
+	uploadDone := make(chan struct{})
+
+	go func() {
+		defer close(uploadDone)
+		_, copyErr := io.Copy(pw, local)
+		_ = pw.CloseWithError(copyErr)
+	}()
+
+	resp, err := client.Do(req)
+	if err != nil {
+		cancel()
+		_ = pr.CloseWithError(err)
+		_ = pw.CloseWithError(err)
+		_ = writeLocalProxyError(conn0)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.ProtoMajor != 2 {
+		cancel()
+		_ = writeLocalProxyError(conn0)
+		return
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		cancel()
+		_ = writeLocalProxyError(conn0)
+		return
+	}
+
+	_, _ = io.Copy(local, resp.Body)
+
+	cancel()
+	_ = conn0.Close()
+	<-uploadDone
+
+	logger.PrintfX("[-] client [%s] disconnected\n", conn0.RemoteAddr().String())
+}
+
+func newH2TunnelRequest(
+	ctx context.Context,
+	listenConfig *ListenConfig,
+	body io.Reader,
+) (*http.Request, error) {
+	host := hostHeaderFromAddress(listenConfig.ServerAddress)
+	url := "https://" + host + tunnelPath
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, body)
+	if err != nil {
+		return nil, err
+	}
+
+	nonce, err := randomNonce()
+	if err != nil {
+		return nil, err
+	}
+
+	ts := time.Now().Unix()
+
+	signature := makeTunnelAuthSignatureV2(
+		listenConfig.Secret,
+		http.MethodPost,
+		tunnelPath,
+		host,
+		nonce,
+		ts,
+		protoH2,
+	)
+
+	req.Host = host
+	req.ContentLength = -1
+
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set("Cache-Control", "no-cache")
+	req.Header.Set("Pragma", "no-cache")
+	req.Header.Set(headerSessionID, nonce)
+	req.Header.Set(headerRequestTime, strconv.FormatInt(ts, 10))
+	req.Header.Set(headerRequestSignature, signature)
+
+	return req, nil
+}
+
+func handleForwardHTTP1(
 	ctx context.Context,
 	listenConfig *ListenConfig,
 	conn0 net.Conn,
@@ -148,6 +369,7 @@ func handleForward(
 	defer conn0.Close()
 
 	done := make(chan struct{})
+
 	go func() {
 		select {
 		case <-ctx.Done():
@@ -155,6 +377,7 @@ func handleForward(
 		case <-done:
 		}
 	}()
+
 	defer close(done)
 
 	conn1, err := dialTLSConn(ctx, listenConfig.ServerAddress, tlsCfg)
@@ -166,6 +389,7 @@ func handleForward(
 		_ = writeLocalProxyError(conn0)
 		return
 	}
+
 	defer conn1.Close()
 
 	go func() {
@@ -221,7 +445,7 @@ func dialTLSConn(ctx context.Context, address string, tlsCfg *tls.Config) (*tls.
 	return conn, nil
 }
 
-func bootstrapTunnelSession(
+func bootstrapHTTP1TunnelSession(
 	ctx context.Context,
 	listenConfig *ListenConfig,
 	tlsCfg *tls.Config,
@@ -240,9 +464,6 @@ func bootstrapTunnelSession(
 		return err
 	}
 
-	// TLS 1.3 session tickets can arrive after the handshake.
-	// Do a tiny best-effort read to give crypto/tls a chance to process them.
-	// Timeout is ignored because the server is not expected to send app data here.
 	primeTLSSessionTicket(conn1)
 
 	return nil
@@ -266,12 +487,14 @@ func writeTunnelUpgradeRequest(conn net.Conn, listenConfig *ListenConfig) error 
 	ts := time.Now().Unix()
 	host := hostHeaderFromAddress(listenConfig.ServerAddress)
 
-	signature := makeTunnelAuthSignature(
+	signature := makeTunnelAuthSignatureV2(
 		listenConfig.Secret,
+		http.MethodGet,
 		tunnelPath,
 		host,
 		nonce,
 		ts,
+		protoHTTP1,
 	)
 
 	req := fmt.Sprintf(
@@ -317,6 +540,7 @@ func readTunnelUpgradeResponse(conn net.Conn) error {
 	if err != nil {
 		return err
 	}
+
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusSwitchingProtocols {
@@ -336,6 +560,7 @@ func readTunnelUpgradeResponse(conn net.Conn) error {
 
 func randomNonce() (string, error) {
 	var b [16]byte
+
 	if _, err := rand.Read(b[:]); err != nil {
 		return "", err
 	}

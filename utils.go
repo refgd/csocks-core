@@ -21,7 +21,10 @@ const (
 	methodHttp   byte = 0x01
 
 	timeout int = 10
-	Version     = "v0.0.3"
+	Version     = "v0.0.1"
+
+	protoH2    = "h2"
+	protoHTTP1 = "http/1.1"
 
 	tunnelPath         = "/assets/update"
 	tunnelUpgradeToken = "websocket"
@@ -38,14 +41,14 @@ type deadlineConn struct {
 	idleTimeout time.Duration
 }
 
-func (c *deadlineConn) Read(b []byte) (n int, err error) {
+func (c *deadlineConn) Read(b []byte) (int, error) {
 	if err := c.resetDeadline(); err != nil {
 		return 0, err
 	}
 	return c.Conn.Read(b)
 }
 
-func (c *deadlineConn) Write(b []byte) (n int, err error) {
+func (c *deadlineConn) Write(b []byte) (int, error) {
 	if err := c.resetDeadline(); err != nil {
 		return 0, err
 	}
@@ -60,10 +63,15 @@ func (c *deadlineConn) resetDeadline() error {
 }
 
 func newDeadlineConn(conn net.Conn, idleTimeout time.Duration) *deadlineConn {
-	return &deadlineConn{Conn: conn, idleTimeout: idleTimeout}
+	return &deadlineConn{
+		Conn:        conn,
+		idleTimeout: idleTimeout,
+	}
 }
 
-type closeWriter interface{ CloseWrite() error }
+type closeWriter interface {
+	CloseWrite() error
+}
 
 func tryCloseWrite(conn net.Conn) {
 	if cw, ok := conn.(closeWriter); ok {
@@ -78,6 +86,7 @@ func mutualCopyIO(ctx context.Context, conn0, conn1 net.Conn) {
 	w1 := newDeadlineConn(conn1, 60*time.Second)
 
 	done := make(chan struct{})
+
 	go func() {
 		select {
 		case <-ctx.Done():
@@ -86,6 +95,7 @@ func mutualCopyIO(ctx context.Context, conn0, conn1 net.Conn) {
 		case <-done:
 		}
 	}()
+
 	defer close(done)
 
 	var wg sync.WaitGroup
@@ -138,6 +148,7 @@ func loadPublicKey(s string) ([]byte, error) {
 	if len(data) == 0 {
 		return nil, errors.New("public key file is empty")
 	}
+
 	return data, nil
 }
 
@@ -182,6 +193,23 @@ func makeTunnelAuthSignature(secret, path, host, nonce string, ts int64) string 
 
 	mac := hmac.New(sha256.New, []byte(secret))
 	_, _ = mac.Write([]byte(msg))
+
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func makeTunnelAuthSignatureV2(secret, method, path, host, nonce string, ts int64, proto string) string {
+	msg := strings.Join([]string{
+		method,
+		path,
+		host,
+		nonce,
+		strconv.FormatInt(ts, 10),
+		proto,
+	}, "\n")
+
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = mac.Write([]byte(msg))
+
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
