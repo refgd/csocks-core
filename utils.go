@@ -3,10 +3,14 @@ package csocks
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"io"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -16,10 +20,17 @@ const (
 	methodSocks5 byte = 0x00
 	methodHttp   byte = 0x01
 
-	replySuccess byte = 0x09
-
 	timeout int = 10
-	Version     = "v0.0.1"
+	Version     = "v0.0.3"
+
+	tunnelPath         = "/assets/update"
+	tunnelUpgradeToken = "websocket"
+
+	headerSessionID        = "X-Session-Id"
+	headerRequestTime      = "X-Request-Time"
+	headerRequestSignature = "X-Request-Signature"
+
+	authClockSkewSeconds = 120
 )
 
 type deadlineConn struct {
@@ -80,14 +91,12 @@ func mutualCopyIO(ctx context.Context, conn0, conn1 net.Conn) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// conn1 -> conn0
 	go func() {
 		defer wg.Done()
 		_, _ = io.Copy(w0, w1)
 		tryCloseWrite(conn0)
 	}()
 
-	// conn0 -> conn1
 	go func() {
 		defer wg.Done()
 		_, _ = io.Copy(w1, w0)
@@ -108,7 +117,6 @@ func listen(listenPort string) (net.Listener, error) {
 }
 
 func loadPublicKey(s string) ([]byte, error) {
-	// inline: prefix => treat as literal key text
 	if after, ok := strings.CutPrefix(s, "inline:"); ok {
 		key := strings.TrimSpace(after)
 		if key == "" {
@@ -131,4 +139,57 @@ func loadPublicKey(s string) ([]byte, error) {
 		return nil, errors.New("public key file is empty")
 	}
 	return data, nil
+}
+
+func hostFromAddress(address string) string {
+	host, _, err := net.SplitHostPort(address)
+	if err == nil {
+		return strings.Trim(host, "[]")
+	}
+
+	if h, _, ok := strings.Cut(address, ":"); ok {
+		return strings.Trim(h, "[]")
+	}
+
+	return strings.Trim(address, "[]")
+}
+
+func hostHeaderFromAddress(address string) string {
+	if strings.TrimSpace(address) == "" {
+		return "localhost"
+	}
+	return address
+}
+
+func serverNameFromAddress(address string) string {
+	host := hostFromAddress(address)
+	if host == "" {
+		return ""
+	}
+	if net.ParseIP(host) != nil {
+		return ""
+	}
+	return host
+}
+
+func makeTunnelAuthSignature(secret, path, host, nonce string, ts int64) string {
+	msg := strings.Join([]string{
+		path,
+		host,
+		nonce,
+		strconv.FormatInt(ts, 10),
+	}, "\n")
+
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = mac.Write([]byte(msg))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func headerContainsToken(v, token string) bool {
+	for _, part := range strings.Split(v, ",") {
+		if strings.EqualFold(strings.TrimSpace(part), token) {
+			return true
+		}
+	}
+	return false
 }

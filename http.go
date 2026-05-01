@@ -30,14 +30,18 @@ func (l *connListener) Accept() (net.Conn, error) {
 	return &connCloser{l: l, Conn: conn}, nil
 }
 
-func (l *connListener) shutdown() { l.once.Do(func() { close(l.ch) }) }
+func (l *connListener) shutdown() {
+	l.once.Do(func() { close(l.ch) })
+}
 
 func (l *connListener) Close() error {
 	l.shutdown()
 	return nil
 }
 
-func (l *connListener) Addr() net.Addr { return l.addr }
+func (l *connListener) Addr() net.Addr {
+	return l.addr
+}
 
 type connCloser struct {
 	l *connListener
@@ -92,21 +96,21 @@ func handleHttpRequest(ctx context.Context, negotiationRequest *negotiationReque
 func handleTunneling(ctx context.Context, w http.ResponseWriter, r *http.Request) {
 	remoteConn, err := net.DialTimeout("tcp", r.Host, time.Duration(timeout)*time.Second)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
 		return
 	}
 
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
 		_ = remoteConn.Close()
-		http.Error(w, "hijack not supported", http.StatusInternalServerError)
+		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
 		return
 	}
 
 	centralConn, _, err := hijacker.Hijack()
 	if err != nil {
 		_ = remoteConn.Close()
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
 		return
 	}
 
@@ -116,9 +120,22 @@ func handleTunneling(ctx context.Context, w http.ResponseWriter, r *http.Request
 }
 
 func handleHttp(ctx context.Context, w http.ResponseWriter, req *http.Request) {
-	resp, err := http.DefaultTransport.RoundTrip(req)
+	outReq := req.Clone(ctx)
+	outReq.RequestURI = ""
+
+	if outReq.URL.Scheme == "" {
+		outReq.URL.Scheme = "http"
+	}
+	if outReq.URL.Host == "" {
+		outReq.URL.Host = outReq.Host
+	}
+
+	outReq.Header.Del("Proxy-Connection")
+	outReq.Header.Del("Connection")
+
+	resp, err := http.DefaultTransport.RoundTrip(outReq)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
 		return
 	}
 	defer resp.Body.Close()
@@ -128,6 +145,7 @@ func handleHttp(ctx context.Context, w http.ResponseWriter, req *http.Request) {
 			w.Header().Add(k, v)
 		}
 	}
+
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
 }

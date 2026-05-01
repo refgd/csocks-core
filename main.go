@@ -35,6 +35,8 @@ func StartServer(ctx context.Context, listenConfig *ListenConfig, quiet bool) er
 	logger = newCustomLogger()
 	logger.quiet = quiet
 
+	logger.Printf("[*] csocks version: [%s]\n", Version)
+
 	if listenConfig.ServerAddress != "" {
 		err := forward(ctx, listenConfig)
 		if err != nil {
