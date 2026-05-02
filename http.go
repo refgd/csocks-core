@@ -3,142 +3,112 @@ package csocks
 import (
 	"bufio"
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
-	"sync"
+	"strings"
 	"time"
 )
-
-type connListener struct {
-	addr net.Addr
-	ch   chan net.Conn
-	once sync.Once
-}
-
-func newConnListener(conn net.Conn, reader *bufio.Reader) net.Listener {
-	ch := make(chan net.Conn, 1)
-	ch <- &readConn{
-		Conn:   conn,
-		reader: reader,
-	}
-
-	return &connListener{
-		addr: conn.LocalAddr(),
-		ch:   ch,
-	}
-}
-
-func (l *connListener) Accept() (net.Conn, error) {
-	conn, ok := <-l.ch
-	if !ok || conn == nil {
-		return nil, io.EOF
-	}
-
-	return &connCloser{
-		l:    l,
-		Conn: conn,
-	}, nil
-}
-
-func (l *connListener) shutdown() {
-	l.once.Do(func() {
-		close(l.ch)
-	})
-}
-
-func (l *connListener) Close() error {
-	l.shutdown()
-	return nil
-}
-
-func (l *connListener) Addr() net.Addr {
-	return l.addr
-}
-
-type connCloser struct {
-	l *connListener
-	net.Conn
-}
-
-func (c *connCloser) Close() error {
-	c.l.shutdown()
-	return c.Conn.Close()
-}
-
-type readConn struct {
-	net.Conn
-	reader   *bufio.Reader
-	readOnce bool
-}
-
-func (c *readConn) Read(b []byte) (int, error) {
-	if c.readOnce {
-		return c.Conn.Read(b)
-	}
-
-	c.readOnce = true
-	return c.reader.Read(b)
-}
 
 func handleHttpRequest(ctx context.Context, negotiationRequest *negotiationRequest) {
 	defer negotiationRequest.Conn.Close()
 
-	done := make(chan struct{})
+	reader := negotiationRequest.Reader
+	if reader == nil {
+		reader = bufio.NewReader(negotiationRequest.Conn)
+	}
 
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = negotiationRequest.Listener.Close()
-		case <-done:
+	req, err := http.ReadRequest(reader)
+	if err != nil {
+		if err != io.EOF {
+			logger.PrintfX("[x] http read request error: [%s]\n", err.Error())
 		}
-	}()
+		return
+	}
+	defer req.Body.Close()
 
-	defer close(done)
+	logger.PrintfX("[http] method=%s host=%s url=%s requestURI=%s\n",
+		req.Method,
+		req.Host,
+		req.URL.String(),
+		req.RequestURI,
+	)
 
-	err := http.Serve(negotiationRequest.Listener, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodConnect {
-			handleTunneling(ctx, w, r)
+	if req.Method == http.MethodConnect {
+		handleHttpConnectDirect(ctx, negotiationRequest.Conn, reader, req)
+		return
+	}
+
+	handleHttpForwardDirect(ctx, negotiationRequest.Conn, req)
+}
+
+func handleHttpConnectDirect(
+	ctx context.Context,
+	clientConn net.Conn,
+	reader *bufio.Reader,
+	req *http.Request,
+) {
+	host := strings.TrimSpace(req.Host)
+	if host == "" && req.URL != nil {
+		host = strings.TrimSpace(req.URL.Host)
+	}
+
+	if host == "" {
+		writeHTTPProxyError(clientConn, http.StatusBadRequest)
+		return
+	}
+
+	dialer := &net.Dialer{
+		Timeout: time.Duration(timeout) * time.Second,
+	}
+
+	remoteConn, err := dialer.DialContext(ctx, "tcp", host)
+	if err != nil {
+		logger.PrintfX("[x] CONNECT dial failed host=%s err=%s\n", host, err.Error())
+		writeHTTPProxyError(clientConn, http.StatusServiceUnavailable)
+		return
+	}
+
+	if _, err := io.WriteString(clientConn, "HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
+		logger.PrintfX("[x] CONNECT write 200 failed host=%s err=%s\n", host, err.Error())
+		_ = remoteConn.Close()
+		return
+	}
+
+	if reader != nil && reader.Buffered() > 0 {
+		n := reader.Buffered()
+
+		if _, err := io.CopyN(remoteConn, reader, int64(n)); err != nil {
+			logger.PrintfX("[x] CONNECT flush buffered bytes failed host=%s n=%d err=%s\n",
+				host,
+				n,
+				err.Error(),
+			)
+			_ = remoteConn.Close()
 			return
 		}
-
-		handleHttp(ctx, w, r)
-	}))
-
-	if err != nil && err != io.EOF {
-		logger.Printf("[x] http error [%s]\n", err.Error())
 	}
+
+	logger.PrintfX("[+] CONNECT established host=%s\n", host)
+
+	mutualCopyIO(ctx, clientConn, remoteConn)
+
+	logger.PrintfX("[-] CONNECT closed host=%s\n", host)
 }
 
-func handleTunneling(ctx context.Context, w http.ResponseWriter, r *http.Request) {
-	remoteConn, err := net.DialTimeout("tcp", r.Host, time.Duration(timeout)*time.Second)
-	if err != nil {
-		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
-		return
-	}
-
-	hijacker, ok := w.(http.Hijacker)
-	if !ok {
-		_ = remoteConn.Close()
-		http.Error(w, "service unavailable", http.StatusInternalServerError)
-		return
-	}
-
-	centralConn, _, err := hijacker.Hijack()
-	if err != nil {
-		_ = remoteConn.Close()
-		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
-		return
-	}
-
-	_, _ = centralConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
-
-	mutualCopyIO(ctx, centralConn, remoteConn)
-}
-
-func handleHttp(ctx context.Context, w http.ResponseWriter, req *http.Request) {
+func handleHttpForwardDirect(
+	ctx context.Context,
+	clientConn net.Conn,
+	req *http.Request,
+) {
 	outReq := req.Clone(ctx)
 	outReq.RequestURI = ""
+
+	if outReq.URL == nil {
+		writeHTTPProxyError(clientConn, http.StatusBadRequest)
+		return
+	}
 
 	if outReq.URL.Scheme == "" {
 		outReq.URL.Scheme = "http"
@@ -148,11 +118,21 @@ func handleHttp(ctx context.Context, w http.ResponseWriter, req *http.Request) {
 		outReq.URL.Host = outReq.Host
 	}
 
+	if outReq.URL.Host == "" {
+		writeHTTPProxyError(clientConn, http.StatusBadRequest)
+		return
+	}
+
 	cleanProxyHeaders(outReq.Header)
 
 	resp, err := http.DefaultTransport.RoundTrip(outReq)
 	if err != nil {
-		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+		logger.PrintfX("[x] HTTP roundtrip failed host=%s url=%s err=%s\n",
+			outReq.Host,
+			outReq.URL.String(),
+			err.Error(),
+		)
+		writeHTTPProxyError(clientConn, http.StatusServiceUnavailable)
 		return
 	}
 
@@ -160,14 +140,40 @@ func handleHttp(ctx context.Context, w http.ResponseWriter, req *http.Request) {
 
 	cleanProxyHeaders(resp.Header)
 
-	for k, vv := range resp.Header {
-		for _, v := range vv {
-			w.Header().Add(k, v)
-		}
+	resp.Close = true
+	resp.Header.Set("Connection", "close")
+
+	if err := resp.Write(clientConn); err != nil {
+		logger.PrintfX("[x] HTTP response write failed err=%s\n", err.Error())
+		return
+	}
+}
+
+func writeHTTPProxyError(conn net.Conn, code int) {
+	if conn == nil {
+		return
 	}
 
-	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(w, resp.Body)
+	text := http.StatusText(code)
+	if text == "" {
+		text = "Error"
+	}
+
+	body := text + "\n"
+
+	_, _ = fmt.Fprintf(
+		conn,
+		"HTTP/1.1 %d %s\r\n"+
+			"Content-Type: text/plain; charset=utf-8\r\n"+
+			"Content-Length: %d\r\n"+
+			"Connection: close\r\n"+
+			"\r\n"+
+			"%s",
+		code,
+		text,
+		len(body),
+		body,
+	)
 }
 
 func cleanProxyHeaders(h http.Header) {

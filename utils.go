@@ -22,7 +22,7 @@ const (
 	methodHttp   byte = 0x01
 
 	timeout int = 10
-	Version     = "v0.0.3"
+	Version     = "v0.0.4"
 
 	protoH2    = "h2"
 	protoHTTP1 = "http/1.1"

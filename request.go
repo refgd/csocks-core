@@ -26,9 +26,9 @@ var replayMap = newNonceReplayCache()
 
 type negotiationRequest struct {
 	net.Conn
-	Method   byte
-	Address  string
-	Listener net.Listener
+	Method  byte
+	Address string
+	Reader  *bufio.Reader
 }
 
 type sniffedConn struct {
@@ -833,9 +833,9 @@ func parseRequest(c net.Conn, r *bufio.Reader, withHttp bool) (*negotiationReque
 
 	if withHttp {
 		return &negotiationRequest{
-			Conn:     c,
-			Method:   methodHttp,
-			Listener: newConnListener(c, r),
+			Conn:   c,
+			Method: methodHttp,
+			Reader: r,
 		}, nil
 	}
 
